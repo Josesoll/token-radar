@@ -1,27 +1,35 @@
-// Signal Sweep — a token launch radar built from one sealed DefiLlama snapshot.
+// Launch Radar v2 — a token launch radar whose value model is FITTED on the
+// snapshot's own tokenized protocols and VALIDATED held-out, twice.
 //
-// The idea is different from a flat TVL multiple. Tokenized protocols in the same
-// snapshot tell us what the market actually pays per dollar of TVL, category by
-// category. A pre-token protocol is therefore priced first from its own category's
-// peer evidence, then adjusted for the three things its own record shows:
-// momentum (7-day TVL change), longevity (days tracked with no token) and breadth
-// (how many chains its TVL already spans).
+// What the session's exploration found (2026-11-22, against the sealed snapshot):
+//   - Only 128 of the 758 protocols carry a usable market cap (mcap_usd > 0).
+//     The other 288 that record a token have no market cap in the file, so the
+//     fit set is 128, not 416. Fitting on anything else would be fiction.
+//   - log(market cap) is regressed on log(TVL), clamped 7-day change, log age,
+//     log chain count and one dummy per category with >= 7 fit peers, by ridge
+//     regression (lambda 30). Unpenalised OLS was tried first: its change and
+//     category coefficients swung wildly between splits (change -10.9 in one
+//     split, -0.3 in the other), so ridge is what keeps the model honest.
+//   - Held-out, twice: split A (hash parity of the slug, 69 fit / 59 test)
+//     median absolute log error 1.266; split B (slug-order halves, 64 / 64)
+//     median 1.140. A TVL-only baseline scores 1.243 / 1.070 on the same
+//     splits, so the extra terms do not beat TVL alone — they are kept small
+//     by the ridge penalty and adjust the ranking modestly. Market caps are
+//     noisy: a typical miss is about a factor of 3. The board is a ranking
+//     device, not a price forecast, and the dashboard says so in plain words.
+//   - Token odds come from the peer set too: the shrunk share of protocols in
+//     the same category that already record a token, blended toward the
+//     overall share (0.549). No name is ever special-cased.
 //
 // Universe accounting, always from the snapshot itself:
-//   758 protocols = 416 that already record a token (set aside, market priced)
-//                 + 342 that record no token (gecko_id and symbol both null)
+//   758 protocols = 416 that record a token (gecko_id or symbol present)
+//                 + 342 that record no token
 //   Of the 342, 144 are not a launch of their own — wrapped / staked / bridged
 //   products, centralised exchanges, versioned pools of another protocol — and
 //   are set aside too. The board ranks the remaining 198 launch candidates and
 //   covers all 40 watchlist slugs, which all survive that filter.
 //
-// Revision (sweep-2): peer ratios are winsorised before any median is taken — a
-// single tokenized peer whose market cap dwarfs its TVL (a prediction market at
-// 400x) would otherwise drag a whole category to the cap on one observation.
-// Category medians are also shrunk harder toward the global median (k = 8), so
-// thin categories borrow strength from the whole market instead of shouting.
-//
-// No protocol name is ever special-cased. One function prices every row.
+// No protocol name is ever special-cased. One fitted function prices every row.
 
 export interface SnapshotProtocol {
   slug: string;
@@ -44,41 +52,68 @@ export interface Snapshot {
   watchlist: string[];
 }
 
-export interface ModelConstants {
-  shrink_k: number;        // peer-evidence shrinkage weight toward the global median
-  peer_floor: number;      // lowest peer multiple the model will use
-  peer_cap: number;        // highest peer multiple the model will use
-  ratio_winsor_low: number;  // each peer's mcap/TVL is held at or above this before medians
-  ratio_winsor_high: number; // ... and at or below this, so one outlier peer cannot rule a category
-  momentum_gain: number;   // weight of clamped 7d change
-  momentum_floor: number;  // clamp for change_7d, percent
-  momentum_cap: number;
-  longevity_floor: number; // multiplier for a brand-new protocol
-  longevity_range: number; // extra multiplier earned over longevity_days
-  longevity_days: number;  // days of no-token history for the full range
-  unknown_age_days: number;
-  breadth_step: number;    // multiplier added per extra chain
-  breadth_max_extra: number;
+/** Ridge specification. Only the penalty, the clamps and the peer-count floor
+ *  are chosen here; every coefficient is fitted from the snapshot at run time. */
+export interface RidgeSpec {
+  lambda: number; // ridge penalty on every term except the intercept
+  change_floor: number; // clamp for change_7d, percent
+  change_cap: number;
+  category_min_peers: number; // a category needs this many fit peers for its own dummy
+  odds_shrink_k: number; // pseudo-count blending a category's token share toward the overall share
 }
 
-export const MODEL: ModelConstants = {
-  shrink_k: 8,
-  peer_floor: 0.06,
-  peer_cap: 1.0,
-  ratio_winsor_low: 0.02,
-  ratio_winsor_high: 2.5,
-  momentum_gain: 0.55,
-  momentum_floor: -40,
-  momentum_cap: 60,
-  longevity_floor: 0.72,
-  longevity_range: 0.48,
-  longevity_days: 1825,
-  unknown_age_days: 450,
-  breadth_step: 0.03,
-  breadth_max_extra: 6,
+export const RIDGE: RidgeSpec = {
+  lambda: 30,
+  change_floor: -30,
+  change_cap: 30,
+  category_min_peers: 7,
+  odds_shrink_k: 5,
 };
 
-export const MODEL_VERSION = 'sweep-2';
+export const MODEL_VERSION = 'launch-radar-v2';
+
+/** One held-out validation split, computed by fitting on its fit part only. */
+export interface ValidationSplit {
+  name: string;
+  n_fit: number;
+  n_test: number;
+  median_abs_log_error: number;
+  mean_abs_log_error: number;
+}
+
+/** The fitted model, as the dashboard's methodology view shows it. */
+export interface FittedModel {
+  version: string;
+  lambda: number;
+  fit_n: number; // tokenized protocols with a usable market cap (128 on this snapshot)
+  tokenized_recorded: number; // protocols that record a token at all (416)
+  no_mcap: number; // of those, how many carry no market cap
+  median_age_days: number; // median age of the fit set; unknown ages are set to this
+  intercept: number;
+  coef_log_tvl: number;
+  coef_change: number;
+  coef_log_age: number;
+  coef_log_chains: number;
+  categories: string[]; // categories with their own dummy, in feature order
+  category_coefs: number[];
+  global_token_share: number; // share of all protocols that record a token
+  validation: ValidationSplit[];
+  in_sample_median_abs_log_error: number;
+  tvl_only_validation: ValidationSplit[]; // the baseline the extra terms are judged against
+}
+
+/** Additive log-space breakdown of one protocol's implied value. Each term is
+ *  the fitted coefficient times the protocol's feature; exp(term) is the
+ *  multiplier the detail view shows, and the terms sum to log(implied). */
+export interface TermBreakdown {
+  intercept: number;
+  log_tvl: number;
+  change: number;
+  log_age: number;
+  log_chains: number;
+  category: number;
+  category_name: string | null;
+}
 
 export interface BoardRow {
   rank: number;
@@ -96,14 +131,10 @@ export interface BoardRow {
   watchlist: boolean;
   age_days: number | null;
   implied_value_usd: number;
-  model: {
-    peer_multiple: number;
-    peer_samples: number;
-    momentum_multiplier: number;
-    longevity_multiplier: number;
-    breadth_multiplier: number;
-    age_days: number | null;
-  };
+  token_odds: number; // shrunk share of same-category protocols that already record a token
+  token_odds_n: number; // protocols in the category the odds are counted over
+  token_odds_tokenized: number; // of those, how many record a token
+  model: TermBreakdown & { age_days: number | null };
   farm_steps: string[];
 }
 
@@ -120,11 +151,10 @@ export interface RadarRow {
   age_days: number | null;
   watchlist: boolean;
   implied_value_usd: number;
-  peer_multiple: number;
-  peer_samples: number;
-  momentum_multiplier: number;
-  longevity_multiplier: number;
-  breadth_multiplier: number;
+  token_odds: number;
+  token_odds_n: number;
+  token_odds_tokenized: number;
+  terms: TermBreakdown;
   farm_steps: string[];
 }
 
@@ -143,9 +173,8 @@ export interface RadarData {
   as_of: string;
   source: string;
   floor_usd: number;
-  model: ModelConstants;
+  model: FittedModel;
   model_version: string;
-  global_peer_multiple: number;
   counts: {
     protocols: number;
     tokenized: number;
@@ -201,60 +230,232 @@ function median(values: number[]): number {
   return sorted.length % 2 === 1 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2;
 }
 
-/** Peer evidence: median market-cap / TVL for tokenized protocols, global and per category.
- *  Each peer's ratio is winsorised into the model's band first, so a single extreme
- *  peer (a market cap hundreds of times its TVL) counts as a strong peer, not a ruler. */
-export function peerEvidence(snapshot: Snapshot, model: ModelConstants = MODEL): { global: number; byCategory: Map<string, { median: number; samples: number }> } {
-  const ratios: number[] = [];
-  const perCat = new Map<string, number[]>();
-  for (const p of snapshot.protocols) {
-    if (recordsNoToken(p) || p.mcap_usd === null || p.mcap_usd <= 0 || p.tvl_usd <= 0) continue;
-    const raw = p.mcap_usd / p.tvl_usd;
-    if (!Number.isFinite(raw) || raw <= 0) continue;
-    const ratio = Math.min(model.ratio_winsor_high, Math.max(model.ratio_winsor_low, raw));
-    ratios.push(ratio);
-    const key = p.category ?? 'Uncategorised';
-    const list = perCat.get(key) ?? [];
-    list.push(ratio);
-    perCat.set(key, list);
-  }
-  const byCategory = new Map<string, { median: number; samples: number }>();
-  for (const [key, list] of perCat) byCategory.set(key, { median: median(list), samples: list.length });
-  return { global: median(ratios), byCategory };
+/** The fit set: protocols whose token's market cap the snapshot actually
+ *  carries (mcap_usd > 0). A recorded token with no market cap cannot teach
+ *  the regression anything, so those 272 are excluded here, not imputed. */
+export function fitSet(snapshot: Snapshot): SnapshotProtocol[] {
+  return snapshot.protocols.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0);
 }
 
-/** The peer multiple one protocol gets: its category median shrunk toward the global median. */
-export function peerMultiple(
+/** Categories earning their own dummy: >= category_min_peers fit peers,
+ *  ordered by peer count desc, then name — deterministic on any snapshot. */
+export function fitCategories(fit: SnapshotProtocol[], spec: RidgeSpec): string[] {
+  const counts = new Map<string, number>();
+  for (const p of fit) counts.set(p.category ?? 'Uncategorised', (counts.get(p.category ?? 'Uncategorised') ?? 0) + 1);
+  return [...counts.entries()]
+    .filter(([, n]) => n >= spec.category_min_peers)
+    .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+    .map(([name]) => name);
+}
+
+export function medianFitAge(fit: SnapshotProtocol[], asOf: string): number {
+  const ages = fit.map((p) => ageDays(asOf, p.listed_at)).filter((a): a is number => a !== null);
+  return ages.length === 0 ? 1000 : median(ages);
+}
+
+/** Feature vector for one protocol, in the fitted model's order:
+ *  [1, ln TVL, clamped change/100, ln(1+age), ln(chains), category dummies]. */
+export function features(
   p: SnapshotProtocol,
-  evidence: { global: number; byCategory: Map<string, { median: number; samples: number }> },
-  model: ModelConstants,
-): { multiple: number; samples: number } {
-  const cat = evidence.byCategory.get(p.category ?? 'Uncategorised');
-  const samples = cat?.samples ?? 0;
-  const catMedian = cat?.median ?? evidence.global;
-  const shrunk = (samples * catMedian + model.shrink_k * evidence.global) / (samples + model.shrink_k);
-  const multiple = Math.min(model.peer_cap, Math.max(model.peer_floor, shrunk));
-  return { multiple, samples };
+  categories: string[],
+  medianAge: number,
+  asOf: string,
+  spec: RidgeSpec,
+): number[] {
+  const age = ageDays(asOf, p.listed_at) ?? medianAge;
+  const change = Math.min(spec.change_cap, Math.max(spec.change_floor, typeof p.change_7d === 'number' && Number.isFinite(p.change_7d) ? p.change_7d : 0)) / 100;
+  const key = p.category ?? 'Uncategorised';
+  return [1, Math.log(p.tvl_usd), change, Math.log1p(Math.max(0, age)), Math.log(Math.max(1, p.chains.length)), ...categories.map((c) => (key === c ? 1 : 0))];
+}
+
+/** Ridge regression by normal equations + Gauss-Jordan. The intercept is
+ *  never penalised. Deterministic: same inputs, same coefficients. */
+export function ridgeFit(X: number[][], y: number[], lambda: number): number[] {
+  const k = X[0]!.length;
+  const A: number[][] = Array.from({ length: k }, () => new Array<number>(k).fill(0));
+  const b: number[] = new Array<number>(k).fill(0);
+  for (let i = 0; i < X.length; i++) {
+    for (let r = 0; r < k; r++) {
+      b[r]! += X[i]![r]! * y[i]!;
+      for (let c = 0; c < k; c++) A[r]![c]! += X[i]![r]! * X[i]![c]!;
+    }
+  }
+  for (let i = 1; i < k; i++) A[i]![i]! += lambda;
+  const M = A.map((row, i) => [...row, b[i]!]);
+  for (let col = 0; col < k; col++) {
+    let piv = col;
+    for (let r = col + 1; r < k; r++) if (Math.abs(M[r]![col]!) > Math.abs(M[piv]![col]!)) piv = r;
+    [M[col], M[piv]] = [M[piv]!, M[col]!];
+    const d = M[col]![col]!;
+    for (let j = col; j <= k; j++) M[col]![j]! /= d;
+    for (let r = 0; r < k; r++) {
+      if (r === col) continue;
+      const f = M[r]![col]!;
+      for (let j = col; j <= k; j++) M[r]![j]! -= f * M[col]![j]!;
+    }
+  }
+  return M.map((row) => row[k]!);
+}
+
+function absLogErrors(fit: SnapshotProtocol[], test: SnapshotProtocol[], categories: string[], medianAge: number, asOf: string, spec: RidgeSpec): number[] {
+  const beta = ridgeFit(
+    fit.map((p) => features(p, categories, medianAge, asOf, spec)),
+    fit.map((p) => Math.log(p.mcap_usd!)),
+    spec.lambda,
+  );
+  return test
+    .map((p) => {
+      const x = features(p, categories, medianAge, asOf, spec);
+      const pred = beta.reduce((s, v, i) => s + v * x[i]!, 0);
+      return Math.abs(pred - Math.log(p.mcap_usd!));
+    })
+    .sort((a, b) => a - b);
+}
+
+function summariseErrors(name: string, fit: SnapshotProtocol[], test: SnapshotProtocol[], categories: string[], medianAge: number, asOf: string, spec: RidgeSpec): ValidationSplit {
+  const errs = absLogErrors(fit, test, categories, medianAge, asOf, spec);
+  return {
+    name,
+    n_fit: fit.length,
+    n_test: test.length,
+    median_abs_log_error: round4(errs[Math.floor(errs.length / 2)] ?? 0),
+    mean_abs_log_error: round4(errs.reduce((s, e) => s + e, 0) / Math.max(1, errs.length)),
+  };
+}
+
+const slugHash = (slug: string): number => [...slug].reduce((s, c) => s + c.charCodeAt(0), 0);
+
+/** Fit the model on the whole fit set and validate it twice, each time by
+ *  fitting on one part only and scoring the held-out part. Split A is hash
+ *  parity of the slug; split B is the slug-order halves. The same two splits
+ *  are also run for a TVL-only baseline, so the dashboard can say honestly
+ *  whether the extra terms earned their keep. */
+export function fitModel(snapshot: Snapshot, spec: RidgeSpec = RIDGE): { model: FittedModel; beta: number[]; categories: string[]; medianAge: number } {
+  const fit = fitSet(snapshot);
+  const categories = fitCategories(fit, spec);
+  const medianAge = medianFitAge(fit, snapshot.as_of);
+  const beta = ridgeFit(
+    fit.map((p) => features(p, categories, medianAge, snapshot.as_of, spec)),
+    fit.map((p) => Math.log(p.mcap_usd!)),
+    spec.lambda,
+  );
+  const tokenizedRecorded = snapshot.protocols.filter((p) => !recordsNoToken(p)).length;
+  const globalShare = tokenizedRecorded / Math.max(1, snapshot.protocols.length);
+
+  const splitA_fit = fit.filter((p) => slugHash(p.slug) % 2 === 0);
+  const splitA_test = fit.filter((p) => slugHash(p.slug) % 2 === 1);
+  const sorted = [...fit].sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
+  const splitB_fit = sorted.slice(0, Math.floor(sorted.length / 2));
+  const splitB_test = sorted.slice(Math.floor(sorted.length / 2));
+  const validation = [
+    summariseErrors('Split A — hash parity of slug', splitA_fit, splitA_test, categories, medianAge, snapshot.as_of, spec),
+    summariseErrors('Split B — slug-order halves', splitB_fit, splitB_test, categories, medianAge, snapshot.as_of, spec),
+  ];
+  // TVL-only baseline on the same splits: intercept + ln TVL, no other terms.
+  const tvlOnly = (fitPart: SnapshotProtocol[], testPart: SnapshotProtocol[]): ValidationSplit => {
+    const b = ridgeFit(
+      fitPart.map((p) => [1, Math.log(p.tvl_usd)]),
+      fitPart.map((p) => Math.log(p.mcap_usd!)),
+      0,
+    );
+    const errs = testPart.map((p) => Math.abs(b[0]! + b[1]! * Math.log(p.tvl_usd) - Math.log(p.mcap_usd!))).sort((a, b) => a - b);
+    return {
+      name: '',
+      n_fit: fitPart.length,
+      n_test: testPart.length,
+      median_abs_log_error: round4(errs[Math.floor(errs.length / 2)] ?? 0),
+      mean_abs_log_error: round4(errs.reduce((s, e) => s + e, 0) / Math.max(1, errs.length)),
+    };
+  };
+  const tvlOnlyA = tvlOnly(splitA_fit, splitA_test);
+  tvlOnlyA.name = validation[0]!.name;
+  const tvlOnlyB = tvlOnly(splitB_fit, splitB_test);
+  tvlOnlyB.name = validation[1]!.name;
+  const inSample = absLogErrors(fit, fit, categories, medianAge, snapshot.as_of, spec);
+
+  const model: FittedModel = {
+    version: MODEL_VERSION,
+    lambda: spec.lambda,
+    fit_n: fit.length,
+    tokenized_recorded: tokenizedRecorded,
+    no_mcap: tokenizedRecorded - fit.length,
+    median_age_days: Math.round(medianAge),
+    intercept: round4(beta[0]!),
+    coef_log_tvl: round4(beta[1]!),
+    coef_change: round4(beta[2]!),
+    coef_log_age: round4(beta[3]!),
+    coef_log_chains: round4(beta[4]!),
+    categories,
+    category_coefs: categories.map((_, i) => round4(beta[5 + i]!)),
+    global_token_share: round4(globalShare),
+    validation,
+    in_sample_median_abs_log_error: round4(inSample[Math.floor(inSample.length / 2)] ?? 0),
+    tvl_only_validation: [tvlOnlyA, tvlOnlyB],
+  };
+  return { model, beta, categories, medianAge };
+}
+
+/** Token odds for one protocol, from the peer set: the share of protocols in
+ *  its category that already record a token, shrunk toward the overall share
+ *  with a pseudo-count, so a thin category cannot claim 0% or 100%. */
+export function tokenOdds(
+  p: SnapshotProtocol,
+  snapshot: Snapshot,
+  spec: RidgeSpec,
+): { odds: number; n: number; tokenized: number } {
+  const key = p.category ?? 'Uncategorised';
+  let n = 0;
+  let tokenized = 0;
+  let all = 0;
+  let allTokenized = 0;
+  for (const q of snapshot.protocols) {
+    if (!recordsNoToken(q)) allTokenized++;
+    all++;
+    if ((q.category ?? 'Uncategorised') !== key) continue;
+    n++;
+    if (!recordsNoToken(q)) tokenized++;
+  }
+  const overall = all === 0 ? 0 : allTokenized / all;
+  const odds = (tokenized + spec.odds_shrink_k * overall) / (n + spec.odds_shrink_k);
+  return { odds, n, tokenized };
+}
+
+/** Additive log-space breakdown of one protocol's fitted value. */
+export function termBreakdown(
+  p: SnapshotProtocol,
+  beta: number[],
+  categories: string[],
+  medianAge: number,
+  asOf: string,
+  spec: RidgeSpec,
+): TermBreakdown {
+  const x = features(p, categories, medianAge, asOf, spec);
+  const key = p.category ?? 'Uncategorised';
+  const catIdx = categories.indexOf(key);
+  return {
+    intercept: beta[0]!,
+    log_tvl: beta[1]! * x[1]!,
+    change: beta[2]! * x[2]!,
+    log_age: beta[3]! * x[3]!,
+    log_chains: beta[4]! * x[4]!,
+    category: catIdx >= 0 ? beta[5 + catIdx]! : 0,
+    category_name: catIdx >= 0 ? key : null,
+  };
 }
 
 export function impliedValue(
   p: SnapshotProtocol,
+  beta: number[],
+  categories: string[],
+  medianAge: number,
   asOf: string,
-  evidence: { global: number; byCategory: Map<string, { median: number; samples: number }> },
-  model: ModelConstants,
-): { implied: number; peer: number; peerSamples: number; momentumMult: number; longevityMult: number; breadthMult: number; age: number | null } {
-  const { multiple: peer, samples: peerSamples } = peerMultiple(p, evidence, model);
-  const rawChange = typeof p.change_7d === 'number' && Number.isFinite(p.change_7d) ? p.change_7d : 0;
-  const change = Math.min(model.momentum_cap, Math.max(model.momentum_floor, rawChange));
-  const momentumMult = 1 + (change / 100) * model.momentum_gain;
+  spec: RidgeSpec,
+): { implied: number; terms: TermBreakdown; age: number | null } {
+  const terms = termBreakdown(p, beta, categories, medianAge, asOf, spec);
+  const logValue = terms.intercept + terms.log_tvl + terms.change + terms.log_age + terms.log_chains + terms.category;
   const age = ageDays(asOf, p.listed_at);
-  const ageForModel = age ?? model.unknown_age_days;
-  const longevityMult =
-    model.longevity_floor + model.longevity_range * Math.sqrt(Math.min(Math.max(ageForModel, 0), model.longevity_days) / model.longevity_days);
-  const extraChains = Math.min(Math.max(p.chains.length - 1, 0), model.breadth_max_extra);
-  const breadthMult = 1 + model.breadth_step * extraChains;
-  const implied = Math.max(1, Math.round(p.tvl_usd * peer * momentumMult * longevityMult * breadthMult));
-  return { implied, peer, peerSamples, momentumMult, longevityMult, breadthMult, age };
+  const implied = Math.max(1, Math.round(Math.exp(logValue)));
+  return { implied, terms, age };
 }
 
 // ---------------------------------------------------------------- farm plans
@@ -417,13 +618,14 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): string[] {
 
 // ---------------------------------------------------------------- board
 
-export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): BoardRow[] {
-  const evidence = peerEvidence(snapshot, model);
+export function buildBoard(snapshot: Snapshot, spec: RidgeSpec = RIDGE): BoardRow[] {
+  const { beta, categories, medianAge } = fitModel(snapshot, spec);
   const watch = new Set(snapshot.watchlist);
   const candidates = snapshot.protocols.filter(isLaunchCandidate);
   const scored = candidates.map((p) => {
-    const v = impliedValue(p, snapshot.as_of, evidence, model);
-    return { p, ...v };
+    const v = impliedValue(p, beta, categories, medianAge, snapshot.as_of, spec);
+    const odds = tokenOdds(p, snapshot, spec);
+    return { p, ...v, odds };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
   return scored.map((s, i) => ({
@@ -442,12 +644,17 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     watchlist: watch.has(s.p.slug),
     age_days: s.age,
     implied_value_usd: s.implied,
+    token_odds: round4(s.odds.odds),
+    token_odds_n: s.odds.n,
+    token_odds_tokenized: s.odds.tokenized,
     model: {
-      peer_multiple: round4(s.peer),
-      peer_samples: s.peerSamples,
-      momentum_multiplier: round4(s.momentumMult),
-      longevity_multiplier: round4(s.longevityMult),
-      breadth_multiplier: round4(s.breadthMult),
+      intercept: round4(s.terms.intercept),
+      log_tvl: round4(s.terms.log_tvl),
+      change: round4(s.terms.change),
+      log_age: round4(s.terms.log_age),
+      log_chains: round4(s.terms.log_chains),
+      category: round4(s.terms.category),
+      category_name: s.terms.category_name,
       age_days: s.age,
     },
     farm_steps: farmSteps(s.p, s.age),
@@ -471,17 +678,10 @@ export function liveRows(snapshot: Snapshot): LiveRow[] {
     }));
 }
 
-export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
-  const board = buildBoard(snapshot, model);
+export function buildRadar(snapshot: Snapshot, spec: RidgeSpec = RIDGE): { board: BoardRow[]; radar: RadarData } {
+  const board = buildBoard(snapshot, spec);
   const live = liveRows(snapshot);
-  const evidence = peerEvidence(snapshot, model);
-  // The dashboard recomputes each row to prove the arithmetic, so its copy of the
-  // peer multiple keeps full precision; board.json's model block rounds to 4dp.
-  const bySlug = new Map(snapshot.protocols.map((p) => [p.slug, p]));
-  const rawPeer = (slug: string): number => {
-    const p = bySlug.get(slug);
-    return p === undefined ? 0 : peerMultiple(p, evidence, model).multiple;
-  };
+  const { model } = fitModel(snapshot, spec);
   const preToken = snapshot.protocols.filter(recordsNoToken).length;
   const radar: RadarData = {
     as_of: snapshot.as_of,
@@ -489,7 +689,6 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     floor_usd: snapshot.floor_usd,
     model,
     model_version: MODEL_VERSION,
-    global_peer_multiple: round4(evidence.global),
     counts: {
       protocols: snapshot.protocols.length,
       tokenized: snapshot.protocols.length - preToken,
@@ -512,11 +711,18 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
       age_days: r.age_days,
       watchlist: r.watchlist,
       implied_value_usd: r.implied_value_usd,
-      peer_multiple: rawPeer(r.slug),
-      peer_samples: r.model.peer_samples,
-      momentum_multiplier: r.model.momentum_multiplier,
-      longevity_multiplier: r.model.longevity_multiplier,
-      breadth_multiplier: r.model.breadth_multiplier,
+      token_odds: r.token_odds,
+      token_odds_n: r.token_odds_n,
+      token_odds_tokenized: r.token_odds_tokenized,
+      terms: {
+        intercept: r.model.intercept,
+        log_tvl: r.model.log_tvl,
+        change: r.model.change,
+        log_age: r.model.log_age,
+        log_chains: r.model.log_chains,
+        category: r.model.category,
+        category_name: r.model.category_name,
+      },
       farm_steps: r.farm_steps,
     })),
     live,

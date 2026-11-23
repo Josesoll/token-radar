@@ -1,8 +1,9 @@
-// Signal Sweep — token-radar-01 entry program (Node 22, standard library only).
+// Launch Radar v2 — token-radar-01 entry program (Node 22, standard library only).
 //
 // Reads the sealed snapshot (--input <file|dir>, default /input/snapshot.json),
-// prices every launch candidate with the peer-anchored model in lib/model.ts,
-// then writes, into the output directory:
+// prices every launch candidate with the ridge-fitted model in lib/model.ts
+// (fitted on the snapshot's 128 protocols with a usable market cap, validated
+// held-out twice), then writes, into the output directory:
 //   board.json    the ranked board the gate reads
 //   data.js       the same board, as the dashboard's offline dataset
 //   dashboard/    a copy of this repository's dashboard/
@@ -34,7 +35,7 @@ function arg(name: string, fallback: string): string {
 const inputArg = arg('input', '/input');
 const inputFile = inputArg.endsWith('.json') ? inputArg : join(inputArg, 'snapshot.json');
 if (!existsSync(inputFile)) {
-  process.stderr.write(`signal sweep: no snapshot at ${inputFile} — pass --input <snapshot.json|directory>\n`);
+  process.stderr.write(`launch radar v2: no snapshot at ${inputFile} — pass --input <snapshot.json|directory>\n`);
   process.exit(2);
 }
 const out = arg('output', process.env.MAKEFUN_OUTPUT_DIR ?? '/output');
@@ -43,7 +44,7 @@ const snapshot = parseSnapshot(readFileSync(inputFile, 'utf8'));
 const { board, radar } = buildRadar(snapshot);
 const issue = boardIssue(board, snapshot);
 if (issue !== null) {
-  process.stderr.write(`signal sweep: refusing to write a board the gate would reject: ${issue}\n`);
+  process.stderr.write(`launch radar v2: refusing to write a board the gate would reject: ${issue}\n`);
   process.exit(1);
 }
 
@@ -68,12 +69,12 @@ function copyFiles(from: string, to: string): string[] {
 const dashFiles = copyFiles(join(here, 'dashboard'), join(out, 'dashboard'));
 const shots = copyFiles(join(here, 'screenshots'), join(out, 'screenshots'));
 if (shots.length < 3 || shots.length > 4) {
-  process.stderr.write(`signal sweep: screenshots/ holds ${shots.length} images — hand in 3: board, detail, filtered\n`);
+  process.stderr.write(`launch radar v2: screenshots/ holds ${shots.length} images — hand in 3: board, detail, filtered\n`);
   process.exit(1);
 }
 for (const name of shots) {
   if (!IMAGE_NAME.test(name)) {
-    process.stderr.write(`signal sweep: screenshots/${name} is not a plain dossier image name\n`);
+    process.stderr.write(`launch radar v2: screenshots/${name} is not a plain dossier image name\n`);
     process.exit(1);
   }
 }
@@ -84,8 +85,12 @@ writeFileSync(
 );
 
 process.stdout.write(
-  `signal sweep: ${radar.counts.protocols} protocols — ${radar.counts.tokenized} tokenized set aside, ` +
+  `launch radar v2: ${radar.counts.protocols} protocols — ${radar.counts.tokenized} record a token, ` +
     `${radar.counts.not_own_launch} pre-token but not an own launch, ${board.length} ranked ` +
-    `(${radar.counts.watchlist} watchlist + ${radar.counts.early} early), global peer multiple ${radar.global_peer_multiple}\n` +
-    `signal sweep: wrote board.json, data.js, dashboard/ (${dashFiles.length} files), screenshots/ (${shots.length}) and dossier.json in ${out}\n`,
+    `(${radar.counts.watchlist} watchlist + ${radar.counts.early} early), fitted on ${radar.model.fit_n} peers ` +
+    `(logTVL coef ${radar.model.coef_log_tvl})\n` +
+    `launch radar v2: held-out median abs log error ${radar.model.validation[0]!.median_abs_log_error} (split A) / ` +
+    `${radar.model.validation[1]!.median_abs_log_error} (split B); TVL-only baseline ` +
+    `${radar.model.tvl_only_validation[0]!.median_abs_log_error} / ${radar.model.tvl_only_validation[1]!.median_abs_log_error}\n` +
+    `launch radar v2: wrote board.json, data.js, dashboard/ (${dashFiles.length} files), screenshots/ (${shots.length}) and dossier.json in ${out}\n`,
 );
