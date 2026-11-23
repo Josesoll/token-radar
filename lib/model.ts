@@ -1,35 +1,37 @@
-// Launch Radar v2 — a token launch radar whose value model is FITTED on the
-// snapshot's own tokenized protocols and VALIDATED held-out, twice.
+// Launch Radar v2 — the model library.
 //
-// What the session's exploration found (2026-11-22, against the sealed snapshot):
-//   - Only 128 of the 758 protocols carry a usable market cap (mcap_usd > 0).
-//     The other 288 that record a token have no market cap in the file, so the
-//     fit set is 128, not 416. Fitting on anything else would be fiction.
-//   - log(market cap) is regressed on log(TVL), clamped 7-day change, log age,
-//     log chain count and one dummy per category with >= 7 fit peers, by ridge
-//     regression (lambda 30). Unpenalised OLS was tried first: its change and
-//     category coefficients swung wildly between splits (change -10.9 in one
-//     split, -0.3 in the other), so ridge is what keeps the model honest.
-//   - Held-out, twice: split A (hash parity of the slug, 69 fit / 59 test)
-//     median absolute log error 1.266; split B (slug-order halves, 64 / 64)
-//     median 1.140. A TVL-only baseline scores 1.243 / 1.070 on the same
-//     splits, so the extra terms do not beat TVL alone — they are kept small
-//     by the ridge penalty and adjust the ranking modestly. Market caps are
-//     noisy: a typical miss is about a factor of 3. The board is a ranking
-//     device, not a price forecast, and the dashboard says so in plain words.
-//   - Token odds come from the peer set too: the shrunk share of protocols in
-//     the same category that already record a token, blended toward the
-//     overall share (0.549). No name is ever special-cased.
+// Everything in this file is derived from one sealed DefiLlama snapshot and
+// nothing else: no network, no hand-kept lists, no per-protocol adjustments.
 //
-// Universe accounting, always from the snapshot itself:
-//   758 protocols = 416 that record a token (gecko_id or symbol present)
-//                 + 342 that record no token
-//   Of the 342, 144 are not a launch of their own — wrapped / staked / bridged
-//   products, centralised exchanges, versioned pools of another protocol — and
-//   are set aside too. The board ranks the remaining 198 launch candidates and
-//   covers all 40 watchlist slugs, which all survive that filter.
+// The valuation model is a ridge regression fitted at run time. Its training
+// set is the snapshot's own tokenized protocols — but only the 128 of them
+// whose market cap the file actually carries (mcap_usd > 0). The remaining
+// 288 protocols that record a token have no market cap in the snapshot, so
+// they cannot teach a regression anything and are left out of the fit.
 //
-// No protocol name is ever special-cased. One fitted function prices every row.
+//   log(market cap) ~ intercept
+//                   + b1 * ln(TVL)
+//                   + b2 * (7-day change, clamped to ±30%, in units of 100%)
+//                   + b3 * ln(1 + age in days)
+//                   + b4 * ln(chain count)
+//                   + one dummy per category with >= 7 training peers
+//
+// Ridge (lambda 30) is used because plain least squares proved unstable on
+// this data: refit on two halves of the training set, its change coefficient
+// swung from about -11 to about -0.3. The penalty keeps every coefficient
+// small and stable, at the price of a deliberately conservative fit.
+//
+// Validation is part of the program, not a claim beside it. fitModel refits
+// on two different splits of the training set (hash parity of the slug, and
+// the slug-order halves) and scores the held-out part of each, and it runs a
+// TVL-only baseline through the same two splits so the reader can see what
+// the extra terms are worth. On this snapshot they are worth little: the
+// full model's held-out median absolute log error is 1.266 / 1.140 against
+// the baseline's 1.243 / 1.070. The dashboard prints all four numbers.
+//
+// Token odds are a second, separate statistic: within a protocol's category,
+// the share of protocols that already record a token, shrunk toward the
+// overall share so thin categories cannot read 0% or 100%.
 
 export interface SnapshotProtocol {
   slug: string;
@@ -52,14 +54,12 @@ export interface Snapshot {
   watchlist: string[];
 }
 
-/** Ridge specification. Only the penalty, the clamps and the peer-count floor
- *  are chosen here; every coefficient is fitted from the snapshot at run time. */
 export interface RidgeSpec {
-  lambda: number; // ridge penalty on every term except the intercept
-  change_floor: number; // clamp for change_7d, percent
+  lambda: number;
+  change_floor: number;
   change_cap: number;
-  category_min_peers: number; // a category needs this many fit peers for its own dummy
-  odds_shrink_k: number; // pseudo-count blending a category's token share toward the overall share
+  category_min_peers: number;
+  odds_shrink_k: number;
 }
 
 export const RIDGE: RidgeSpec = {
@@ -72,7 +72,6 @@ export const RIDGE: RidgeSpec = {
 
 export const MODEL_VERSION = 'launch-radar-v2';
 
-/** One held-out validation split, computed by fitting on its fit part only. */
 export interface ValidationSplit {
   name: string;
   n_fit: number;
@@ -81,30 +80,26 @@ export interface ValidationSplit {
   mean_abs_log_error: number;
 }
 
-/** The fitted model, as the dashboard's methodology view shows it. */
 export interface FittedModel {
   version: string;
   lambda: number;
-  fit_n: number; // tokenized protocols with a usable market cap (128 on this snapshot)
-  tokenized_recorded: number; // protocols that record a token at all (416)
-  no_mcap: number; // of those, how many carry no market cap
-  median_age_days: number; // median age of the fit set; unknown ages are set to this
+  fit_n: number;
+  tokenized_recorded: number;
+  no_mcap: number;
+  median_age_days: number;
   intercept: number;
   coef_log_tvl: number;
   coef_change: number;
   coef_log_age: number;
   coef_log_chains: number;
-  categories: string[]; // categories with their own dummy, in feature order
+  categories: string[];
   category_coefs: number[];
-  global_token_share: number; // share of all protocols that record a token
+  global_token_share: number;
   validation: ValidationSplit[];
   in_sample_median_abs_log_error: number;
-  tvl_only_validation: ValidationSplit[]; // the baseline the extra terms are judged against
+  tvl_only_validation: ValidationSplit[];
 }
 
-/** Additive log-space breakdown of one protocol's implied value. Each term is
- *  the fitted coefficient times the protocol's feature; exp(term) is the
- *  multiplier the detail view shows, and the terms sum to log(implied). */
 export interface TermBreakdown {
   intercept: number;
   log_tvl: number;
@@ -131,9 +126,9 @@ export interface BoardRow {
   watchlist: boolean;
   age_days: number | null;
   implied_value_usd: number;
-  token_odds: number; // shrunk share of same-category protocols that already record a token
-  token_odds_n: number; // protocols in the category the odds are counted over
-  token_odds_tokenized: number; // of those, how many record a token
+  token_odds: number;
+  token_odds_n: number;
+  token_odds_tokenized: number;
   model: TermBreakdown & { age_days: number | null };
   farm_steps: string[];
 }
@@ -197,64 +192,82 @@ export class SnapshotError extends Error {
 
 const DAY_MS = 86_400_000;
 const round4 = (n: number): number => Math.round(n * 1e4) / 1e4;
+const bySlugAsc = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 
 export function ageDays(asOf: string, listedAt: string | null): number | null {
   if (listedAt === null) return null;
-  const a = Date.parse(`${asOf}T00:00:00Z`);
-  const b = Date.parse(`${listedAt}T00:00:00Z`);
-  if (!Number.isFinite(a) || !Number.isFinite(b)) return null;
-  return Math.max(0, Math.floor((a - b) / DAY_MS));
+  const end = Date.parse(`${asOf}T00:00:00Z`);
+  const start = Date.parse(`${listedAt}T00:00:00Z`);
+  if (!Number.isFinite(end) || !Number.isFinite(start)) return null;
+  return Math.max(0, Math.floor((end - start) / DAY_MS));
 }
 
 export function recordsNoToken(p: SnapshotProtocol): boolean {
   return p.gecko_id === null && p.symbol === null;
 }
 
-const NOT_OWN_LAUNCH = new Set(['CEX', 'Bridge', 'Canonical Bridge', 'Liquid Staking', 'Liquid Restaking', 'Restaked BTC']);
-const VERSIONED = /\s(V\d+(\.\d+)?|v\d+(\.\d+)?|\d+\.\d+)$/;
-const WRAPPED_WORD = /\b(wrapped|staked|staking)\b/i;
+// Categories whose members are products of someone else's token rather than
+// a launch of their own. The watchlist rule excludes the same families.
+const WRAPPER_CATEGORIES: ReadonlySet<string> = new Set([
+  'CEX',
+  'Bridge',
+  'Canonical Bridge',
+  'Liquid Staking',
+  'Liquid Restaking',
+  'Restaked BTC',
+]);
+const VERSION_SUFFIX = /\s(V\d+(\.\d+)?|v\d+(\.\d+)?|\d+\.\d+)$/;
+const WRAPPER_WORD = /\b(wrapped|staked|staking)\b/i;
 
-/** Pre-token, and a plausible launch of its own rather than a wrapper of someone else's asset. */
+/** A protocol that records no token and could plausibly launch one of its own. */
 export function isLaunchCandidate(p: SnapshotProtocol): boolean {
   if (!recordsNoToken(p)) return false;
-  if (p.category !== null && NOT_OWN_LAUNCH.has(p.category)) return false;
-  if (VERSIONED.test(p.name)) return false;
-  if (WRAPPED_WORD.test(p.name)) return false;
+  if (p.category !== null && WRAPPER_CATEGORIES.has(p.category)) return false;
+  if (VERSION_SUFFIX.test(p.name)) return false;
+  if (WRAPPER_WORD.test(p.name)) return false;
   return true;
 }
 
-function median(values: number[]): number {
+function medianOf(values: number[]): number {
+  if (values.length === 0) return 0;
   const sorted = [...values].sort((a, b) => a - b);
   const mid = Math.floor(sorted.length / 2);
-  if (sorted.length === 0) return 0;
   return sorted.length % 2 === 1 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2;
 }
 
-/** The fit set: protocols whose token's market cap the snapshot actually
- *  carries (mcap_usd > 0). A recorded token with no market cap cannot teach
- *  the regression anything, so those 272 are excluded here, not imputed. */
+// ------------------------------------------------------------ the fit
+
+/** Training rows: a recorded token whose market cap the snapshot carries. */
 export function fitSet(snapshot: Snapshot): SnapshotProtocol[] {
   return snapshot.protocols.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0);
 }
 
-/** Categories earning their own dummy: >= category_min_peers fit peers,
- *  ordered by peer count desc, then name — deterministic on any snapshot. */
+/** Categories with enough training peers for their own dummy, in a stable
+ *  order: peer count descending, then name ascending. */
 export function fitCategories(fit: SnapshotProtocol[], spec: RidgeSpec): string[] {
   const counts = new Map<string, number>();
-  for (const p of fit) counts.set(p.category ?? 'Uncategorised', (counts.get(p.category ?? 'Uncategorised') ?? 0) + 1);
+  for (const p of fit) {
+    const key = p.category ?? 'Uncategorised';
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
   return [...counts.entries()]
-    .filter(([, n]) => n >= spec.category_min_peers)
-    .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
-    .map(([name]) => name);
+    .filter((entry) => entry[1] >= spec.category_min_peers)
+    .sort((a, b) => b[1] - a[1] || bySlugAsc(a[0], b[0]))
+    .map((entry) => entry[0]);
 }
 
 export function medianFitAge(fit: SnapshotProtocol[], asOf: string): number {
-  const ages = fit.map((p) => ageDays(asOf, p.listed_at)).filter((a): a is number => a !== null);
-  return ages.length === 0 ? 1000 : median(ages);
+  const ages: number[] = [];
+  for (const p of fit) {
+    const a = ageDays(asOf, p.listed_at);
+    if (a !== null) ages.push(a);
+  }
+  return ages.length === 0 ? 1000 : medianOf(ages);
 }
 
-/** Feature vector for one protocol, in the fitted model's order:
- *  [1, ln TVL, clamped change/100, ln(1+age), ln(chains), category dummies]. */
+/** One protocol as a feature row, in the model's fixed order. An unreported
+ *  age is replaced by the training set's median age; an unreported change
+ *  counts as zero; the change is clamped before it is scaled to units of 100%. */
 export function features(
   p: SnapshotProtocol,
   categories: string[],
@@ -263,122 +276,155 @@ export function features(
   spec: RidgeSpec,
 ): number[] {
   const age = ageDays(asOf, p.listed_at) ?? medianAge;
-  const change = Math.min(spec.change_cap, Math.max(spec.change_floor, typeof p.change_7d === 'number' && Number.isFinite(p.change_7d) ? p.change_7d : 0)) / 100;
+  const rawChange = typeof p.change_7d === 'number' && Number.isFinite(p.change_7d) ? p.change_7d : 0;
+  const change = Math.min(spec.change_cap, Math.max(spec.change_floor, rawChange)) / 100;
   const key = p.category ?? 'Uncategorised';
-  return [1, Math.log(p.tvl_usd), change, Math.log1p(Math.max(0, age)), Math.log(Math.max(1, p.chains.length)), ...categories.map((c) => (key === c ? 1 : 0))];
+  const row = [1, Math.log(p.tvl_usd), change, Math.log1p(Math.max(0, age)), Math.log(Math.max(1, p.chains.length))];
+  for (const c of categories) row.push(key === c ? 1 : 0);
+  return row;
 }
 
-/** Ridge regression by normal equations + Gauss-Jordan. The intercept is
- *  never penalised. Deterministic: same inputs, same coefficients. */
+/** Ridge fit by normal equations, solved with Gauss-Jordan elimination.
+ *  The intercept column is exempt from the penalty. Pure arithmetic on the
+ *  inputs, so the same snapshot always yields the same coefficients. */
 export function ridgeFit(X: number[][], y: number[], lambda: number): number[] {
   const k = X[0]!.length;
-  const A: number[][] = Array.from({ length: k }, () => new Array<number>(k).fill(0));
-  const b: number[] = new Array<number>(k).fill(0);
-  for (let i = 0; i < X.length; i++) {
+  const normal: number[][] = [];
+  for (let r = 0; r < k; r++) normal.push(new Array<number>(k).fill(0));
+  const rhs: number[] = new Array<number>(k).fill(0);
+  X.forEach((row, i) => {
     for (let r = 0; r < k; r++) {
-      b[r]! += X[i]![r]! * y[i]!;
-      for (let c = 0; c < k; c++) A[r]![c]! += X[i]![r]! * X[i]![c]!;
+      rhs[r]! += row[r]! * y[i]!;
+      for (let c = 0; c < k; c++) normal[r]![c]! += row[r]! * row[c]!;
     }
-  }
-  for (let i = 1; i < k; i++) A[i]![i]! += lambda;
-  const M = A.map((row, i) => [...row, b[i]!]);
+  });
+  for (let i = 1; i < k; i++) normal[i]![i]! += lambda;
+  const aug = normal.map((row, i) => [...row, rhs[i]!]);
   for (let col = 0; col < k; col++) {
-    let piv = col;
-    for (let r = col + 1; r < k; r++) if (Math.abs(M[r]![col]!) > Math.abs(M[piv]![col]!)) piv = r;
-    [M[col], M[piv]] = [M[piv]!, M[col]!];
-    const d = M[col]![col]!;
-    for (let j = col; j <= k; j++) M[col]![j]! /= d;
+    let pivot = col;
+    for (let r = col + 1; r < k; r++) {
+      if (Math.abs(aug[r]![col]!) > Math.abs(aug[pivot]![col]!)) pivot = r;
+    }
+    const swap = aug[col]!;
+    aug[col] = aug[pivot]!;
+    aug[pivot] = swap;
+    const divisor = aug[col]![col]!;
+    for (let j = col; j <= k; j++) aug[col]![j]! /= divisor;
     for (let r = 0; r < k; r++) {
       if (r === col) continue;
-      const f = M[r]![col]!;
-      for (let j = col; j <= k; j++) M[r]![j]! -= f * M[col]![j]!;
+      const factor = aug[r]![col]!;
+      if (factor === 0) continue;
+      for (let j = col; j <= k; j++) aug[r]![j]! -= factor * aug[col]![j]!;
     }
   }
-  return M.map((row) => row[k]!);
+  return aug.map((row) => row[k]!);
 }
 
-function absLogErrors(fit: SnapshotProtocol[], test: SnapshotProtocol[], categories: string[], medianAge: number, asOf: string, spec: RidgeSpec): number[] {
+function predict(beta: number[], x: number[]): number {
+  let total = 0;
+  for (let i = 0; i < beta.length; i++) total += beta[i]! * x[i]!;
+  return total;
+}
+
+function heldOutErrors(
+  train: SnapshotProtocol[],
+  test: SnapshotProtocol[],
+  categories: string[],
+  medianAge: number,
+  asOf: string,
+  spec: RidgeSpec,
+): number[] {
   const beta = ridgeFit(
-    fit.map((p) => features(p, categories, medianAge, asOf, spec)),
-    fit.map((p) => Math.log(p.mcap_usd!)),
+    train.map((p) => features(p, categories, medianAge, asOf, spec)),
+    train.map((p) => Math.log(p.mcap_usd!)),
     spec.lambda,
   );
-  return test
-    .map((p) => {
-      const x = features(p, categories, medianAge, asOf, spec);
-      const pred = beta.reduce((s, v, i) => s + v * x[i]!, 0);
-      return Math.abs(pred - Math.log(p.mcap_usd!));
-    })
-    .sort((a, b) => a - b);
+  const errors = test.map((p) => Math.abs(predict(beta, features(p, categories, medianAge, asOf, spec)) - Math.log(p.mcap_usd!)));
+  return errors.sort((a, b) => a - b);
 }
 
-function summariseErrors(name: string, fit: SnapshotProtocol[], test: SnapshotProtocol[], categories: string[], medianAge: number, asOf: string, spec: RidgeSpec): ValidationSplit {
-  const errs = absLogErrors(fit, test, categories, medianAge, asOf, spec);
-  return {
-    name,
-    n_fit: fit.length,
-    n_test: test.length,
-    median_abs_log_error: round4(errs[Math.floor(errs.length / 2)] ?? 0),
-    mean_abs_log_error: round4(errs.reduce((s, e) => s + e, 0) / Math.max(1, errs.length)),
-  };
+function splitSummary(
+  name: string,
+  train: SnapshotProtocol[],
+  test: SnapshotProtocol[],
+  categories: string[],
+  medianAge: number,
+  asOf: string,
+  spec: RidgeSpec,
+): ValidationSplit {
+  const errors = heldOutErrors(train, test, categories, medianAge, asOf, spec);
+  const middle = errors[Math.floor(errors.length / 2)] ?? 0;
+  const mean = errors.reduce((sum, e) => sum + e, 0) / Math.max(1, errors.length);
+  return { name, n_fit: train.length, n_test: test.length, median_abs_log_error: round4(middle), mean_abs_log_error: round4(mean) };
 }
 
-const slugHash = (slug: string): number => [...slug].reduce((s, c) => s + c.charCodeAt(0), 0);
+function slugHash(slug: string): number {
+  let h = 0;
+  for (const ch of slug) h += ch.charCodeAt(0);
+  return h;
+}
 
-/** Fit the model on the whole fit set and validate it twice, each time by
- *  fitting on one part only and scoring the held-out part. Split A is hash
- *  parity of the slug; split B is the slug-order halves. The same two splits
- *  are also run for a TVL-only baseline, so the dashboard can say honestly
- *  whether the extra terms earned their keep. */
-export function fitModel(snapshot: Snapshot, spec: RidgeSpec = RIDGE): { model: FittedModel; beta: number[]; categories: string[]; medianAge: number } {
-  const fit = fitSet(snapshot);
-  const categories = fitCategories(fit, spec);
-  const medianAge = medianFitAge(fit, snapshot.as_of);
+/** Fit on the whole training set, then validate twice: each validation refits
+ *  on one part of the training set and scores the other part, which the fit
+ *  never saw. Split A alternates by a hash of the slug; split B cuts the
+ *  slug-sorted list in half. A TVL-only model is run through both splits as
+ *  the baseline the full model has to answer to. */
+export function fitModel(
+  snapshot: Snapshot,
+  spec: RidgeSpec = RIDGE,
+): { model: FittedModel; beta: number[]; categories: string[]; medianAge: number } {
+  const train = fitSet(snapshot);
+  const categories = fitCategories(train, spec);
+  const medianAge = medianFitAge(train, snapshot.as_of);
   const beta = ridgeFit(
-    fit.map((p) => features(p, categories, medianAge, snapshot.as_of, spec)),
-    fit.map((p) => Math.log(p.mcap_usd!)),
+    train.map((p) => features(p, categories, medianAge, snapshot.as_of, spec)),
+    train.map((p) => Math.log(p.mcap_usd!)),
     spec.lambda,
   );
-  const tokenizedRecorded = snapshot.protocols.filter((p) => !recordsNoToken(p)).length;
-  const globalShare = tokenizedRecorded / Math.max(1, snapshot.protocols.length);
 
-  const splitA_fit = fit.filter((p) => slugHash(p.slug) % 2 === 0);
-  const splitA_test = fit.filter((p) => slugHash(p.slug) % 2 === 1);
-  const sorted = [...fit].sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
-  const splitB_fit = sorted.slice(0, Math.floor(sorted.length / 2));
-  const splitB_test = sorted.slice(Math.floor(sorted.length / 2));
+  const recorded = snapshot.protocols.filter((p) => !recordsNoToken(p)).length;
+  const globalShare = recorded / Math.max(1, snapshot.protocols.length);
+
+  const aTrain = train.filter((p) => slugHash(p.slug) % 2 === 0);
+  const aTest = train.filter((p) => slugHash(p.slug) % 2 === 1);
+  const ordered = [...train].sort((a, b) => bySlugAsc(a.slug, b.slug));
+  const half = Math.floor(ordered.length / 2);
+  const bTrain = ordered.slice(0, half);
+  const bTest = ordered.slice(half);
+
+  const nameA = 'Split A — hash parity of slug';
+  const nameB = 'Split B — slug-order halves';
   const validation = [
-    summariseErrors('Split A — hash parity of slug', splitA_fit, splitA_test, categories, medianAge, snapshot.as_of, spec),
-    summariseErrors('Split B — slug-order halves', splitB_fit, splitB_test, categories, medianAge, snapshot.as_of, spec),
+    splitSummary(nameA, aTrain, aTest, categories, medianAge, snapshot.as_of, spec),
+    splitSummary(nameB, bTrain, bTest, categories, medianAge, snapshot.as_of, spec),
   ];
-  // TVL-only baseline on the same splits: intercept + ln TVL, no other terms.
-  const tvlOnly = (fitPart: SnapshotProtocol[], testPart: SnapshotProtocol[]): ValidationSplit => {
-    const b = ridgeFit(
-      fitPart.map((p) => [1, Math.log(p.tvl_usd)]),
-      fitPart.map((p) => Math.log(p.mcap_usd!)),
+
+  const baseline = (name: string, part: SnapshotProtocol[], held: SnapshotProtocol[]): ValidationSplit => {
+    const coef = ridgeFit(
+      part.map((p) => [1, Math.log(p.tvl_usd)]),
+      part.map((p) => Math.log(p.mcap_usd!)),
       0,
     );
-    const errs = testPart.map((p) => Math.abs(b[0]! + b[1]! * Math.log(p.tvl_usd) - Math.log(p.mcap_usd!))).sort((a, b) => a - b);
+    const errors = held
+      .map((p) => Math.abs(coef[0]! + coef[1]! * Math.log(p.tvl_usd) - Math.log(p.mcap_usd!)))
+      .sort((x, y) => x - y);
     return {
-      name: '',
-      n_fit: fitPart.length,
-      n_test: testPart.length,
-      median_abs_log_error: round4(errs[Math.floor(errs.length / 2)] ?? 0),
-      mean_abs_log_error: round4(errs.reduce((s, e) => s + e, 0) / Math.max(1, errs.length)),
+      name,
+      n_fit: part.length,
+      n_test: held.length,
+      median_abs_log_error: round4(errors[Math.floor(errors.length / 2)] ?? 0),
+      mean_abs_log_error: round4(errors.reduce((sum, e) => sum + e, 0) / Math.max(1, errors.length)),
     };
   };
-  const tvlOnlyA = tvlOnly(splitA_fit, splitA_test);
-  tvlOnlyA.name = validation[0]!.name;
-  const tvlOnlyB = tvlOnly(splitB_fit, splitB_test);
-  tvlOnlyB.name = validation[1]!.name;
-  const inSample = absLogErrors(fit, fit, categories, medianAge, snapshot.as_of, spec);
+
+  const inSample = heldOutErrors(train, train, categories, medianAge, snapshot.as_of, spec);
 
   const model: FittedModel = {
     version: MODEL_VERSION,
     lambda: spec.lambda,
-    fit_n: fit.length,
-    tokenized_recorded: tokenizedRecorded,
-    no_mcap: tokenizedRecorded - fit.length,
+    fit_n: train.length,
+    tokenized_recorded: recorded,
+    no_mcap: recorded - train.length,
     median_age_days: Math.round(medianAge),
     intercept: round4(beta[0]!),
     coef_log_tvl: round4(beta[1]!),
@@ -390,14 +436,13 @@ export function fitModel(snapshot: Snapshot, spec: RidgeSpec = RIDGE): { model: 
     global_token_share: round4(globalShare),
     validation,
     in_sample_median_abs_log_error: round4(inSample[Math.floor(inSample.length / 2)] ?? 0),
-    tvl_only_validation: [tvlOnlyA, tvlOnlyB],
+    tvl_only_validation: [baseline(nameA, aTrain, aTest), baseline(nameB, bTrain, bTest)],
   };
   return { model, beta, categories, medianAge };
 }
 
-/** Token odds for one protocol, from the peer set: the share of protocols in
- *  its category that already record a token, shrunk toward the overall share
- *  with a pseudo-count, so a thin category cannot claim 0% or 100%. */
+/** Token odds: the tokenized share of the protocol's own category, shrunk
+ *  toward the snapshot-wide share by a pseudo-count. */
 export function tokenOdds(
   p: SnapshotProtocol,
   snapshot: Snapshot,
@@ -406,21 +451,19 @@ export function tokenOdds(
   const key = p.category ?? 'Uncategorised';
   let n = 0;
   let tokenized = 0;
-  let all = 0;
   let allTokenized = 0;
   for (const q of snapshot.protocols) {
     if (!recordsNoToken(q)) allTokenized++;
-    all++;
     if ((q.category ?? 'Uncategorised') !== key) continue;
     n++;
     if (!recordsNoToken(q)) tokenized++;
   }
-  const overall = all === 0 ? 0 : allTokenized / all;
+  const overall = snapshot.protocols.length === 0 ? 0 : allTokenized / snapshot.protocols.length;
   const odds = (tokenized + spec.odds_shrink_k * overall) / (n + spec.odds_shrink_k);
   return { odds, n, tokenized };
 }
 
-/** Additive log-space breakdown of one protocol's fitted value. */
+/** The fitted log value of one protocol, split into its six additive terms. */
 export function termBreakdown(
   p: SnapshotProtocol,
   beta: number[],
@@ -431,15 +474,15 @@ export function termBreakdown(
 ): TermBreakdown {
   const x = features(p, categories, medianAge, asOf, spec);
   const key = p.category ?? 'Uncategorised';
-  const catIdx = categories.indexOf(key);
+  const at = categories.indexOf(key);
   return {
     intercept: beta[0]!,
     log_tvl: beta[1]! * x[1]!,
     change: beta[2]! * x[2]!,
     log_age: beta[3]! * x[3]!,
     log_chains: beta[4]! * x[4]!,
-    category: catIdx >= 0 ? beta[5 + catIdx]! : 0,
-    category_name: catIdx >= 0 ? key : null,
+    category: at >= 0 ? beta[5 + at]! : 0,
+    category_name: at >= 0 ? key : null,
   };
 }
 
@@ -453,14 +496,24 @@ export function impliedValue(
 ): { implied: number; terms: TermBreakdown; age: number | null } {
   const terms = termBreakdown(p, beta, categories, medianAge, asOf, spec);
   const logValue = terms.intercept + terms.log_tvl + terms.change + terms.log_age + terms.log_chains + terms.category;
-  const age = ageDays(asOf, p.listed_at);
-  const implied = Math.max(1, Math.round(Math.exp(logValue)));
-  return { implied, terms, age };
+  return { implied: Math.max(1, Math.round(Math.exp(logValue))), terms, age: ageDays(asOf, p.listed_at) };
 }
 
-// ---------------------------------------------------------------- farm plans
+// ------------------------------------------------------------ farm plans
+//
+// A plan is assembled from the protocol's own record: its category chooses
+// the core play, its first two chains choose where the steps happen and what
+// gas costs, its TVL tier chooses the suggested capital, and its age and
+// 7-day trend choose the hold length and the warning line. Every step names
+// a cost and a time, because a plan without either is a slogan.
 
-const GAS_BY_CHAIN: Record<string, { asset: string; setup: string; weekly: string }> = {
+interface GasQuote {
+  asset: string;
+  setup: string;
+  weekly: string;
+}
+
+const GAS_BY_CHAIN: Record<string, GasQuote> = {
   Ethereum: { asset: 'ETH', setup: '$9-16', weekly: '$4-7' },
   Solana: { asset: 'SOL', setup: 'under $1', weekly: 'under $1' },
   Base: { asset: 'ETH', setup: 'under $1', weekly: 'under $1' },
@@ -474,7 +527,7 @@ const GAS_BY_CHAIN: Record<string, { asset: string; setup: string; weekly: strin
   Bitcoin: { asset: 'BTC', setup: '$2-5', weekly: '$1-2' },
 };
 
-function gasFor(chain: string): { asset: string; setup: string; weekly: string } {
+function gasFor(chain: string): GasQuote {
   return GAS_BY_CHAIN[chain] ?? { asset: 'the native gas token', setup: '$1-4', weekly: '$1' };
 }
 
@@ -487,123 +540,156 @@ function capitalFor(p: SnapshotProtocol): number {
 }
 
 function holdDaysFor(age: number | null, change: number | null): number {
-  let days = age === null ? 45 : age < 180 ? 75 : age < 540 ? 60 : 40;
+  let days = 45;
+  if (age !== null) days = age < 180 ? 75 : age < 540 ? 60 : 40;
   if (change !== null && change < -10) days += 15;
   return days;
 }
 
-interface CategoryPlay { open: string; follow: string; weekly: string }
+interface CategoryPlay {
+  open: string;
+  follow: string;
+  weekly: string;
+}
 
-function playFor(p: SnapshotProtocol, capital: number, chain: string, secondChain: string | null): CategoryPlay {
-  const c = (p.category ?? '').toLowerCase();
-  const n = p.name;
-  if (c.includes('lend') || c.includes('uncollateral')) {
-    return {
-      open: `Supply $${capital} in USDC as collateral in ${n} on ${chain}, then borrow no more than $${Math.round(capital * 0.4)} against it so the health factor stays comfortably above 2`,
-      follow: `Repay and re-borrow once in the second week on ${n}; two separate borrow cycles read as real credit use, not a one-off deposit`,
+interface PlayContext {
+  p: SnapshotProtocol;
+  capital: number;
+  chain: string;
+  secondChain: string | null;
+}
+
+// Category plays as an ordered rule table: the first rule whose needles all
+// match (any one of them) the lower-cased category writes the play.
+const PLAY_RULES: { needles: string[]; make: (ctx: PlayContext) => CategoryPlay }[] = [
+  {
+    needles: ['lend', 'uncollateral'],
+    make: ({ p, capital, chain }) => ({
+      open: `Supply $${capital} in USDC as collateral in ${p.name} on ${chain}, then borrow no more than $${Math.round(capital * 0.4)} against it so the health factor stays comfortably above 2`,
+      follow: `Repay and re-borrow once in the second week on ${p.name}; two separate borrow cycles read as real credit use, not a one-off deposit`,
       weekly: `Check the health factor and top up collateral if it drifts; one small supply top-up of $10-20 counts as the weekly touch`,
-    };
-  }
-  if (c.includes('dex') || c.includes('liquidity')) {
-    return {
-      open: `Swap $${Math.round(capital / 2)} into the pool's second asset and add $${capital} of paired liquidity to ${n}'s busiest pool on ${chain}`,
-      follow: `Collect the accrued fees once after 10-14 days and re-add them to the same ${n} position instead of withdrawing to a wallet`,
-      weekly: `Make one ordinary swap of $15-30 through ${n} each week, sized like a user trade, and keep the LP position open throughout`,
-    };
-  }
-  if (c.includes('risk curator') || c.includes('allocator') || c.includes('yield aggregator') || c.includes('collateral')) {
-    return {
-      open: `Deposit $${capital} in USDC into one curated vault inside ${n} on ${chain} and keep the vault shares in the same wallet`,
-      follow: `After two weeks move $${Math.round(capital * 0.25)} into a second ${n} vault; using two vaults shows allocator-level activity, not parking`,
+    }),
+  },
+  {
+    needles: ['dex', 'liquidity'],
+    make: ({ p, capital, chain }) => ({
+      open: `Swap $${Math.round(capital / 2)} into the pool's second asset and add $${capital} of paired liquidity to ${p.name}'s busiest pool on ${chain}`,
+      follow: `Collect the accrued fees once after 10-14 days and re-add them to the same ${p.name} position instead of withdrawing to a wallet`,
+      weekly: `Make one ordinary swap of $15-30 through ${p.name} each week, sized like a user trade, and keep the LP position open throughout`,
+    }),
+  },
+  {
+    needles: ['risk curator', 'allocator', 'yield aggregator', 'collateral'],
+    make: ({ p, capital, chain }) => ({
+      open: `Deposit $${capital} in USDC into one curated vault inside ${p.name} on ${chain} and keep the vault shares in the same wallet`,
+      follow: `After two weeks move $${Math.round(capital * 0.25)} into a second ${p.name} vault; using two vaults shows allocator-level activity, not parking`,
       weekly: `Open the vault page weekly, confirm the share value and allocation, and add $10-25 when the vault rebalances`,
-    };
-  }
-  if (c.includes('cdp') || c.includes('stable') || c.includes('basis')) {
-    return {
-      open: `Deposit $${capital} in collateral with ${n} on ${chain} and mint or hold the protocol's dollar asset at no more than half the maximum allowed`,
+    }),
+  },
+  {
+    needles: ['cdp', 'stable', 'basis'],
+    make: ({ p, capital, chain }) => ({
+      open: `Deposit $${capital} in collateral with ${p.name} on ${chain} and mint or hold the protocol's dollar asset at no more than half the maximum allowed`,
       follow: `Hold the minted dollar asset for at least two weeks and provide $${Math.round(capital * 0.3)} of it to the protocol's own stability or liquidity pool if one is offered`,
       weekly: `Check the collateral ratio weekly and add $10-20 of collateral before it can drift toward any liquidation line`,
-    };
-  }
-  if (c.includes('derivative') || c.includes('perpetual') || c.includes('interest rate')) {
-    return {
-      open: `Deposit $${capital} in USDC margin on ${n} (${chain}) and open one small hedged position, long and short legs near equal, so volume is real but risk stays flat`,
-      follow: `Close and reopen the hedge once in week two on ${n}; aim for steady modest volume across days, never one outsized trade`,
-      weekly: `Trade two or three small sessions a week on ${n}, $20-40 of notional each, and leave margin parked between sessions`,
-    };
-  }
-  if (c.includes('prediction')) {
-    return {
-      open: `Fund $${capital} on ${n} and split it across at least four open markets, $10-25 a position, favouring markets that resolve within 30 days`,
-      follow: `Settle the first resolved market and roll the proceeds into a new ${n} market the same week, keeping a continuous trading record`,
-      weekly: `Place two or three considered trades a week on ${n}; a steady record across many markets matters more than one large bet`,
-    };
-  }
-  if (c.includes('rwa') || c.includes('payment') || c.includes('card')) {
-    return {
-      open: `Complete ${n}'s onboarding or KYC if it asks, then deposit or mint $${capital} of its yield-bearing asset on ${chain}`,
-      follow: `Hold the asset through one full distribution or interest cycle on ${n} so the wallet appears in a payout snapshot`,
+    }),
+  },
+  {
+    needles: ['derivative', 'perpetual', 'interest rate'],
+    make: ({ p, capital, chain }) => ({
+      open: `Deposit $${capital} in USDC margin on ${p.name} (${chain}) and open one small hedged position, long and short legs near equal, so volume is real but risk stays flat`,
+      follow: `Close and reopen the hedge once in week two on ${p.name}; aim for steady modest volume across days, never one outsized trade`,
+      weekly: `Trade two or three small sessions a week on ${p.name}, $20-40 of notional each, and leave margin parked between sessions`,
+    }),
+  },
+  {
+    needles: ['prediction'],
+    make: ({ p, capital }) => ({
+      open: `Fund $${capital} on ${p.name} and split it across at least four open markets, $10-25 a position, favouring markets that resolve within 30 days`,
+      follow: `Settle the first resolved market and roll the proceeds into a new ${p.name} market the same week, keeping a continuous trading record`,
+      weekly: `Place two or three considered trades a week on ${p.name}; a steady record across many markets matters more than one large bet`,
+    }),
+  },
+  {
+    needles: ['rwa', 'payment', 'card'],
+    make: ({ p, capital, chain }) => ({
+      open: `Complete ${p.name}'s onboarding or KYC if it asks, then deposit or mint $${capital} of its yield-bearing asset on ${chain}`,
+      follow: `Hold the asset through one full distribution or interest cycle on ${p.name} so the wallet appears in a payout snapshot`,
       weekly: `Check the distribution record weekly and add $10-25 in one of the weeks so the balance is not perfectly static`,
-    };
-  }
-  if (c.includes('staking') || c.includes('restak') || c.includes('anchor') || c.includes('decentralized btc') || c.includes('farm')) {
-    return {
-      open: `Stake $${capital} worth of the underlying asset through ${n} on ${chain} and keep the receipt or restaking position untouched`,
+    }),
+  },
+  {
+    needles: ['staking', 'restak', 'anchor', 'decentralized btc', 'farm'],
+    make: ({ p, capital, chain, secondChain }) => ({
+      open: `Stake $${capital} worth of the underlying asset through ${p.name} on ${chain} and keep the receipt or restaking position untouched`,
       follow: secondChain
-        ? `Add a second, smaller stake of $${Math.round(capital * 0.3)} through ${n} on ${secondChain} so the wallet is active on two of its chains`
-        : `After three weeks delegate or restake the rewards inside ${n} instead of selling them, compounding the position once`,
-      weekly: `Claim or compound rewards weekly inside ${n}; each claim is a cheap, regular on-chain touch`,
-    };
-  }
-  if (c.includes('bridge') || c.includes('cross chain')) {
-    return {
-      open: `Bridge $${capital} in USDC from ${chain} to ${secondChain ?? 'a second supported chain'} through ${n}, then use the bridged funds in a DeFi app on the far side`,
-      follow: `Bridge $${Math.round(capital * 0.4)} back through ${n} after at least two weeks; a round trip counts far more than a one-way transfer`,
+        ? `Add a second, smaller stake of $${Math.round(capital * 0.3)} through ${p.name} on ${secondChain} so the wallet is active on two of its chains`
+        : `After three weeks delegate or restake the rewards inside ${p.name} instead of selling them, compounding the position once`,
+      weekly: `Claim or compound rewards weekly inside ${p.name}; each claim is a cheap, regular on-chain touch`,
+    }),
+  },
+  {
+    needles: ['bridge', 'cross chain'],
+    make: ({ p, capital, chain, secondChain }) => ({
+      open: `Bridge $${capital} in USDC from ${chain} to ${secondChain ?? 'a second supported chain'} through ${p.name}, then use the bridged funds in a DeFi app on the far side`,
+      follow: `Bridge $${Math.round(capital * 0.4)} back through ${p.name} after at least two weeks; a round trip counts far more than a one-way transfer`,
       weekly: `Make one small $15-25 bridge or far-side transaction a week so both chains show continuing activity`,
-    };
-  }
-  if (c.includes('insurance')) {
-    return {
-      open: `Buy $${capital} of cover from ${n} on ${chain} for a position you actually hold elsewhere, with a term of at least 60 days`,
-      follow: `Renew or extend the ${n} cover once before it lapses so coverage is continuous across two periods`,
+    }),
+  },
+  {
+    needles: ['insurance'],
+    make: ({ p, capital, chain }) => ({
+      open: `Buy $${capital} of cover from ${p.name} on ${chain} for a position you actually hold elsewhere, with a term of at least 60 days`,
+      follow: `Renew or extend the ${p.name} cover once before it lapses so coverage is continuous across two periods`,
       weekly: `Review the cover and the covered position weekly; no transaction is needed in weeks where nothing changed`,
-    };
-  }
-  if (c.includes('chain')) {
-    return {
-      open: `Bridge $${Math.round(capital * 0.5)} to ${n}'s chain (${chain}) and make the wallet a regular user: swaps, one lending deposit and one NFT or naming action`,
-      follow: `Use two native ${n} applications in week two so the wallet's activity is not a single bridge-and-leave footprint`,
+    }),
+  },
+  {
+    needles: ['chain'],
+    make: ({ p, capital, chain }) => ({
+      open: `Bridge $${Math.round(capital * 0.5)} to ${p.name}'s chain (${chain}) and make the wallet a regular user: swaps, one lending deposit and one NFT or naming action`,
+      follow: `Use two native ${p.name} applications in week two so the wallet's activity is not a single bridge-and-leave footprint`,
       weekly: `Transact on the chain two or three times a week with ordinary $10-30 actions; consistency is the whole play for a chain`,
-    };
-  }
-  if (c.includes('index') || c.includes('governance')) {
-    return {
-      open: `Buy or mint $${capital} of the ${n} basket or position on ${chain} and hold it in the farming wallet`,
-      follow: `Take part in one ${n} governance vote or rebalance window if one opens during the hold; screenshot the participation for your log`,
+    }),
+  },
+  {
+    needles: ['index', 'governance'],
+    make: ({ p, capital, chain }) => ({
+      open: `Buy or mint $${capital} of the ${p.name} basket or position on ${chain} and hold it in the farming wallet`,
+      follow: `Take part in one ${p.name} governance vote or rebalance window if one opens during the hold; screenshot the participation for your log`,
       weekly: `Check the basket composition weekly and add $10-20 in one week so the position grows at least once`,
-    };
+    }),
+  },
+];
+
+function playFor(ctx: PlayContext): CategoryPlay {
+  const category = (ctx.p.category ?? '').toLowerCase();
+  for (const rule of PLAY_RULES) {
+    if (rule.needles.some((needle) => category.includes(needle))) return rule.make(ctx);
   }
+  const { p, capital, chain } = ctx;
   return {
-    open: `Deposit $${capital} in USDC into ${n}'s main product on ${chain} and keep the position open and untouched by other farms`,
-    follow: `Repeat the core ${n} action once in week three with $15-25 so the wallet shows a returning user, not a single visit`,
-    weekly: `Make one small qualifying action a week inside ${n}, such as a deposit, claim or vote, and never two farms from the same wallet`,
+    open: `Deposit $${capital} in USDC into ${p.name}'s main product on ${chain} and keep the position open and untouched by other farms`,
+    follow: `Repeat the core ${p.name} action once in week three with $15-25 so the wallet shows a returning user, not a single visit`,
+    weekly: `Make one small qualifying action a week inside ${p.name}, such as a deposit, claim or vote, and never two farms from the same wallet`,
   };
 }
 
-/** Seven concrete steps per protocol, assembled from its category, chains, TVL tier and age. */
+/** Seven steps per protocol: wallet setup, the category play in three beats,
+ *  the hold, the log, and the exit — each with its cost and its time. */
 export function farmSteps(p: SnapshotProtocol, age: number | null): string[] {
   const chain = p.chains[0] ?? 'its main chain';
   const secondChain = p.chains.length > 1 ? p.chains[1]! : null;
   const gas = gasFor(chain);
   const capital = capitalFor(p);
   const hold = holdDaysFor(age, p.change_7d);
-  const play = playFor(p, capital, chain, secondChain);
-  const trendNote =
-    p.change_7d !== null && p.change_7d < -10
-      ? ` TVL fell ${Math.abs(p.change_7d).toFixed(1)}% in 7 days, so start at half size and only add if the trend flattens.`
-      : p.change_7d !== null && p.change_7d > 10
-        ? ` TVL rose ${p.change_7d.toFixed(1)}% in 7 days, so expect busy contracts and check gas before the main deposit.`
-        : '';
+  const play = playFor({ p, capital, chain, secondChain });
+  let trendNote = '';
+  if (p.change_7d !== null && p.change_7d < -10) {
+    trendNote = ` TVL fell ${Math.abs(p.change_7d).toFixed(1)}% in 7 days, so start at half size and only add if the trend flattens.`;
+  } else if (p.change_7d !== null && p.change_7d > 10) {
+    trendNote = ` TVL rose ${p.change_7d.toFixed(1)}% in 7 days, so expect busy contracts and check gas before the main deposit.`;
+  }
   const steps = [
     `Set up a fresh wallet for ${p.name} only, fund it on ${chain} with ${gas.asset} for gas plus $${capital + 30} in working capital, and store the seed phrase offline. Cost: ${gas.setup} of gas to fund and bridge in. Time: 20 minutes.${trendNote}`,
     `${play.open}. Cost: $${capital} of capital plus ${gas.setup} of gas on ${chain}. Time: 15-25 minutes to set up carefully.`,
@@ -616,78 +702,95 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): string[] {
   return steps.map((s) => (s.length > 600 ? `${s.slice(0, 596)}...` : s));
 }
 
-// ---------------------------------------------------------------- board
+// ------------------------------------------------------------ the board
+
+interface Fit {
+  model: FittedModel;
+  beta: number[];
+  categories: string[];
+  medianAge: number;
+}
+
+function boardFromFit(snapshot: Snapshot, spec: RidgeSpec, fit: Fit): BoardRow[] {
+  const watch = new Set(snapshot.watchlist);
+  const scored: { row: BoardRow; implied: number; slug: string }[] = [];
+  for (const p of snapshot.protocols) {
+    if (!isLaunchCandidate(p)) continue;
+    const v = impliedValue(p, fit.beta, fit.categories, fit.medianAge, snapshot.as_of, spec);
+    const odds = tokenOdds(p, snapshot, spec);
+    scored.push({
+      implied: v.implied,
+      slug: p.slug,
+      row: {
+        rank: 0,
+        slug: p.slug,
+        name: p.name,
+        category: p.category,
+        chains: p.chains,
+        tvl_usd: p.tvl_usd,
+        change_7d: p.change_7d,
+        mcap_usd: p.mcap_usd,
+        listed_at: p.listed_at,
+        gecko_id: p.gecko_id,
+        symbol: p.symbol,
+        token_status: 'pre-token',
+        watchlist: watch.has(p.slug),
+        age_days: v.age,
+        implied_value_usd: v.implied,
+        token_odds: round4(odds.odds),
+        token_odds_n: odds.n,
+        token_odds_tokenized: odds.tokenized,
+        model: {
+          intercept: round4(v.terms.intercept),
+          log_tvl: round4(v.terms.log_tvl),
+          change: round4(v.terms.change),
+          log_age: round4(v.terms.log_age),
+          log_chains: round4(v.terms.log_chains),
+          category: round4(v.terms.category),
+          category_name: v.terms.category_name,
+          age_days: v.age,
+        },
+        farm_steps: farmSteps(p, v.age),
+      },
+    });
+  }
+  scored.sort((a, b) => b.implied - a.implied || bySlugAsc(a.slug, b.slug));
+  scored.forEach((entry, i) => {
+    entry.row.rank = i + 1;
+  });
+  return scored.map((entry) => entry.row);
+}
 
 export function buildBoard(snapshot: Snapshot, spec: RidgeSpec = RIDGE): BoardRow[] {
-  const { beta, categories, medianAge } = fitModel(snapshot, spec);
-  const watch = new Set(snapshot.watchlist);
-  const candidates = snapshot.protocols.filter(isLaunchCandidate);
-  const scored = candidates.map((p) => {
-    const v = impliedValue(p, beta, categories, medianAge, snapshot.as_of, spec);
-    const odds = tokenOdds(p, snapshot, spec);
-    return { p, ...v, odds };
-  });
-  scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
-  return scored.map((s, i) => ({
-    rank: i + 1,
-    slug: s.p.slug,
-    name: s.p.name,
-    category: s.p.category,
-    chains: s.p.chains,
-    tvl_usd: s.p.tvl_usd,
-    change_7d: s.p.change_7d,
-    mcap_usd: s.p.mcap_usd,
-    listed_at: s.p.listed_at,
-    gecko_id: s.p.gecko_id,
-    symbol: s.p.symbol,
-    token_status: 'pre-token',
-    watchlist: watch.has(s.p.slug),
-    age_days: s.age,
-    implied_value_usd: s.implied,
-    token_odds: round4(s.odds.odds),
-    token_odds_n: s.odds.n,
-    token_odds_tokenized: s.odds.tokenized,
-    model: {
-      intercept: round4(s.terms.intercept),
-      log_tvl: round4(s.terms.log_tvl),
-      change: round4(s.terms.change),
-      log_age: round4(s.terms.log_age),
-      log_chains: round4(s.terms.log_chains),
-      category: round4(s.terms.category),
-      category_name: s.terms.category_name,
-      age_days: s.age,
-    },
-    farm_steps: farmSteps(s.p, s.age),
-  }));
+  return boardFromFit(snapshot, spec, fitModel(snapshot, spec));
 }
 
 export function liveRows(snapshot: Snapshot): LiveRow[] {
-  return snapshot.protocols
-    .filter((p) => !recordsNoToken(p))
-    .sort((a, b) => (b.mcap_usd ?? 0) - (a.mcap_usd ?? 0) || b.tvl_usd - a.tvl_usd || (a.slug < b.slug ? -1 : 1))
-    .slice(0, 36)
-    .map((p) => ({
-      slug: p.slug,
-      name: p.name,
-      category: p.category,
-      chains: p.chains,
-      tvl_usd: p.tvl_usd,
-      mcap_usd: p.mcap_usd,
-      change_7d: p.change_7d,
-      symbol: p.symbol,
-    }));
+  const tokenized = snapshot.protocols.filter((p) => !recordsNoToken(p));
+  tokenized.sort(
+    (a, b) => (b.mcap_usd ?? 0) - (a.mcap_usd ?? 0) || b.tvl_usd - a.tvl_usd || bySlugAsc(a.slug, b.slug),
+  );
+  return tokenized.slice(0, 36).map((p) => ({
+    slug: p.slug,
+    name: p.name,
+    category: p.category,
+    chains: p.chains,
+    tvl_usd: p.tvl_usd,
+    mcap_usd: p.mcap_usd,
+    change_7d: p.change_7d,
+    symbol: p.symbol,
+  }));
 }
 
 export function buildRadar(snapshot: Snapshot, spec: RidgeSpec = RIDGE): { board: BoardRow[]; radar: RadarData } {
-  const board = buildBoard(snapshot, spec);
-  const live = liveRows(snapshot);
-  const { model } = fitModel(snapshot, spec);
+  const fit = fitModel(snapshot, spec);
+  const board = boardFromFit(snapshot, spec, fit);
   const preToken = snapshot.protocols.filter(recordsNoToken).length;
   const radar: RadarData = {
     as_of: snapshot.as_of,
     source: snapshot.source,
     floor_usd: snapshot.floor_usd,
-    model,
+    model: fit.model,
     model_version: MODEL_VERSION,
     counts: {
       protocols: snapshot.protocols.length,
@@ -725,10 +828,12 @@ export function buildRadar(snapshot: Snapshot, spec: RidgeSpec = RIDGE): { board
       },
       farm_steps: r.farm_steps,
     })),
-    live,
+    live: liveRows(snapshot),
   };
   return { board, radar };
 }
+
+// ------------------------------------------------------------ snapshot in, board checked
 
 export function parseSnapshot(text: string): Snapshot {
   let raw: unknown;
@@ -766,6 +871,9 @@ export function parseSnapshot(text: string): Snapshot {
   return { as_of: o.as_of, source: o.source, floor_usd: o.floor_usd, protocols, watchlist: o.watchlist as string[] };
 }
 
+/** Every rule the sealed gate will apply to the board, checked before a
+ *  single byte is written: row count, unique slugs, watchlist coverage,
+ *  ranks exactly 1..N with non-increasing values, value range, farm steps. */
 export function boardIssue(board: BoardRow[], snapshot: Snapshot): string | null {
   if (board.length < 100 || board.length > 4000) return `board has ${board.length} rows`;
   const slugs = new Set(board.map((r) => r.slug));
